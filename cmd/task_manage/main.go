@@ -1,101 +1,69 @@
-// internal/task/generator.go
+// cmd/task_manage/main.go
 package main
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"net_detect/internal/models"
+	"flag"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
+
+	"net_detect/internal/controller"
+	gatewayping "net_detect/internal/taskgen/pinggw"
 )
 
-type Gateway struct {
-	Name    string   `json:"name"`
-	NameEn  string   `json:"name_en"`
-	Gateway []string `json:"gateway"`
-}
-
-type GatewayResponse struct {
-	Code int       `json:"code"`
-	Data []Gateway `json:"data"`
-}
-
-func GenerateGatewayTask(nodes []string) (*models.Task, error) {
-	// 获取网关数据
-	resp, err := http.Get("https://cdn.monitor.just95.net/api/w1/node-gateway")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get gateway data: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	var gatewayResp GatewayResponse
-	if err := json.Unmarshal(body, &gatewayResp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %v", err)
-	}
-
-	if gatewayResp.Code != 0 {
-		return nil, fmt.Errorf("gateway api returned non-zero code: %d", gatewayResp.Code)
-	}
-
-	params := make([]interface{}, 0, len(gatewayResp.Data))
-	for _, gw := range gatewayResp.Data {
-		// 为每个网关创建一个任务
-		for _, ip := range gw.Gateway {
-			param := map[string]interface{}{
-				"ip":       ip,
-				"nodeName": gw.NameEn,
-				"hostName": gw.Name,
-			}
-			params = append(params, param)
-		}
-	}
-	task := models.Task{
-		Name:       "pingMesh",
-		MetricName: "pinggw",
-		NodeNames:  nodes,
-		Params:     params,
-		Interval:   time.Minute,
-	}
-	return &task, nil
-}
-
-func CreateGatewayMonitorTask(controllerURL string, nodes []string) error {
-	// 1. 生成任务参数
-	task, err := GenerateGatewayTask(nodes)
-	if err != nil {
-		return fmt.Errorf("generate gateway task failed: %v", err)
-	}
-
-	// 2. 发送创建任务请求
-	taskBytes, err := json.Marshal(task)
-	if err != nil {
-		return fmt.Errorf("marshal task failed: %v", err)
-	}
-
-	resp, err := http.Post(controllerURL+"/api/tasks", "application/json", bytes.NewBuffer(taskBytes))
-	if err != nil {
-		return fmt.Errorf("create task request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("create task failed with status: %d", resp.StatusCode)
-	}
-
-	return nil
+type Config struct {
+	KafkaBrokers  []string
+	GatewayAPIURL string
+	Nodes         []string
+	Interval      time.Duration
 }
 
 func main() {
-	nodes := []string{"jhct01"}
-	err := CreateGatewayMonitorTask("http://localhost:8088", nodes)
+	// 1. 解析配置
+	var config Config
+	kafkaBrokers := flag.String("brokers", "localhost:9092", "Kafka brokers")
+	gatewayURL := flag.String("gateway-url", "https://cdn.monitor.just95.net/api/w1/node-gateway", "Gateway API URL")
+	interval := flag.Duration("interval", 5*time.Minute, "Task interval")
+	flag.Parse()
+
+	config.KafkaBrokers = strings.Split(*kafkaBrokers, ",")
+	config.GatewayAPIURL = *gatewayURL
+	config.Interval = *interval
+
+	// 2. 创建controller
+	ctrl, err := controller.NewController(config.KafkaBrokers)
 	if err != nil {
-		fmt.Printf("Failed to create gateway monitor task: %v\n", err)
+		log.Fatalf("Failed to create controller: %v", err)
 	}
+	defer ctrl.Stop()
+
+	// 3. 创建Gateway Ping任务生成器
+	gwGenerator := gatewayping.NewGenerator(gatewayping.Config{
+		GatewayAPIURL: config.GatewayAPIURL,
+		Nodes:         config.Nodes,
+		Interval:      config.Interval,
+		MetricName:    "gateway_ping",
+		TaskPrefix:    "gw_ping",
+	})
+	// No need to stop gwGenerator as it does not have a Stop method
+
+	// 4. 生成并添加任务
+	tasks, err := gwGenerator.Generate()
+	if err != nil {
+		log.Printf("Failed to generate gateway tasks: %v", err)
+	}
+
+	for _, task := range tasks {
+		if err := ctrl.AddTask(task); err != nil {
+			log.Printf("Failed to add task %s: %v", task.Name, err)
+		}
+	}
+
+	// 5. 保持运行
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
 }

@@ -2,6 +2,7 @@ package models
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -49,6 +50,11 @@ type Task struct {
 	Params     []interface{}     `json:"params"`     // 任务参数
 	Interval   time.Duration     `json:"interval"`   // 执行频率
 	Tags       map[string]string `json:"tags"`       // 任务标签，可选
+} //
+
+// internal/models/types.go
+func (t *Task) GenerateKey() string {
+	return fmt.Sprintf("%s-%s", t.MetricName, strings.Join(t.NodeNames, "-"))
 }
 
 // GetTopics 获取任务对应的所有topics

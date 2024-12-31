@@ -70,7 +70,15 @@ func (c *Controller) AddTask(t models.Task) error {
 		close(c.runners[t.MetricName])
 	}
 
-	c.tasks[t.MetricName] = t
+	taskKey := t.GenerateKey()
+
+	// 如果任务已存在,关闭其runner
+	if _, exists := c.tasks[taskKey]; exists {
+		if runner, ok := c.runners[taskKey]; ok {
+			close(runner)
+			delete(c.runners, taskKey)
+		}
+	}
 	stopCh := make(chan struct{})
 	c.runners[t.MetricName] = stopCh
 	go c.runTask(t, stopCh)
@@ -78,14 +86,22 @@ func (c *Controller) AddTask(t models.Task) error {
 }
 
 // ReloadTask 重写任务
-func (c *Controller) AppendTask(t models.Task) error {
+func (c *Controller) AppendTask(t models.Task, customKey string) error {
 	c.taskMutex.Lock()
 	defer c.taskMutex.Unlock()
 
-	if _, exists := c.tasks[t.MetricName]; exists {
-		close(c.runners[t.MetricName])
+	taskKey := customKey
+	if taskKey == "" {
+		taskKey = t.GenerateKey()
 	}
 
+	// 如果任务已存在,关闭其runner
+	if _, exists := c.tasks[taskKey]; exists {
+		if runner, ok := c.runners[taskKey]; ok {
+			close(runner)
+			delete(c.runners, taskKey)
+		}
+	}
 	c.tasks[t.MetricName] = t
 	stopCh := make(chan struct{})
 	c.runners[t.MetricName] = stopCh
